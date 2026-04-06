@@ -1,0 +1,27 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables
+.env
+
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Scan results and logs
+*.csv
+scan_summary.txt
+subnet_analysis_report.txt
+test_email_output.txt
+
+# Editor / OS specifics
+.vscode/
+.idea/
+.DS_Store
+
+ips.txt

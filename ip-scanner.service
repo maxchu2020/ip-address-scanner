@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily IP Scanner Service
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/project/ip-address-scanner
+ExecStart=/opt/project/ip-address-scanner/run_scanner.sh
+
+[Install]
+WantedBy=multi-user.target
