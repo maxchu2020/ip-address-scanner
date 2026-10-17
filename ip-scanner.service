@@ -7,6 +7,9 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/project/ip-address-scanner
 ExecStart=/opt/project/ip-address-scanner/run_scanner.sh
+# Results and .env are root-only; a hung scan/SMTP must not block tomorrow's run
+UMask=0077
+TimeoutStartSec=3h
 
 [Install]
 WantedBy=multi-user.target

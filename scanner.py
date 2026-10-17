@@ -1,8 +1,10 @@
 import subprocess
 import os
+import shutil
 import smtplib
 import ipaddress
 import csv
+import html
 import time
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +39,38 @@ def ping_ip(ip):
             pass
     return False
 
+FPING = shutil.which("fping")
+SCAN_TIMEOUT_S = 2 * 3600
+
+
+def ping_all(ip_list, max_workers=100):
+    """
+    Return the set of reachable IPs (as strings).
+
+    Uses fping when available: one process pings the whole list, with the
+    same rules as ping_ip (up to 3 tries, 1 s timeout each), about 1000
+    probes/s. That replaces ~150k `ping` processes and cuts the daily scan
+    from about an hour to minutes. Falls back to ping_ip per address.
+    """
+    if FPING:
+        targets = "\n".join(str(ip) for ip in ip_list) + "\n"
+        # -a alive only, -q quiet, -r 2 retries (3 tries), -t 1000 ms timeout,
+        # -B 1 no backoff, -i 1 ms between probes; targets on stdin
+        proc = subprocess.run(
+            [FPING, "-a", "-q", "-r", "2", "-t", "1000", "-B", "1", "-i", "1"],
+            input=targets, capture_output=True, text=True, timeout=SCAN_TIMEOUT_S,
+        )
+        # exit 0 = all alive, 1 = some unreachable; anything else is an error
+        if proc.returncode not in (0, 1):
+            raise RuntimeError(f"fping failed (exit {proc.returncode}): {proc.stderr.strip()[-300:]}")
+        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+    print("fping not found, falling back to one ping per address (slow).")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        alive = list(executor.map(ping_ip, ip_list))
+    return {str(ip) for ip, ok in zip(ip_list, alive) if ok}
+
+
 def get_c_segment(ip):
     """
     Returns the C-class segment (first three octets) of an IP.
@@ -48,14 +82,12 @@ def run_scanner(ip_list, max_workers=50):
     results = {}
     c_segments = defaultdict(lambda: {"total": 0, "active": 0, "ips": []})
 
-    print(f"Starting scan for {len(ip_list)} IPs using {max_workers} threads...")
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Map ping_ip to the list of IPs
-        ping_results = list(executor.map(ping_ip, ip_list))
+    print(f"Starting scan for {len(ip_list)} IPs ({'fping' if FPING else f'{max_workers} threads'})...")
+    alive_set = ping_all(ip_list, max_workers=max_workers)
 
-    for ip, is_alive in zip(ip_list, ping_results):
+    for ip in ip_list:
         ip_str = str(ip)
+        is_alive = ip_str in alive_set
         results[ip_str] = is_alive
         
         c_seg = get_c_segment(ip_str)
@@ -69,10 +101,12 @@ def run_scanner(ip_list, max_workers=50):
 def parse_ips_from_file(file_path):
     """
     Parses IP addresses and CIDR notations from a file.
+    Returns (ip_list, invalid_lines).
     """
     ip_list = []
+    invalid = []
     if not os.path.exists(file_path):
-        return ip_list
+        return ip_list, invalid
 
     with open(file_path, "r") as f:
         for line in f:
@@ -89,8 +123,9 @@ def parse_ips_from_file(file_path):
                     ip_list.append(ipaddress.ip_address(line))
             except ValueError as e:
                 print(f"Skipping invalid IP/CIDR: {line} ({e})")
-    
-    return ip_list
+                invalid.append(line)
+
+    return ip_list, invalid
 
 def generate_report(c_segments):
     report = "IP Scanner Report - C-Segment Summary\n"
@@ -328,6 +363,7 @@ def generate_html_supernet_report(c_segments):
     return html
 
 def send_email(subject, body_text, body_html=None, attachment_path=None):
+    """Send the report. Returns True if the SMTP server accepted it."""
     smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
     smtp_port = os.getenv("SMTP_PORT", "587")
     smtp_user = os.getenv("SMTP_USER")
@@ -338,19 +374,21 @@ def send_email(subject, body_text, body_html=None, attachment_path=None):
 
     if not all([smtp_user, smtp_password, recipient]):
         print("Skipping email: Gmail credentials or recipient not configured in .env file.")
-        return
+        return False
 
-    msg = MIMEMultipart("alternative")
+    # mixed = [alternative(text, html), attachment]. Putting the attachment
+    # inside "alternative" (as before) makes it a third rendering of the body,
+    # which Outlook / Apple Mail may hide.
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = smtp_user
     msg["To"] = recipient
-    
-    # Attach plain text version
-    msg.attach(MIMEText(body_text, "plain"))
-    
-    # Attach HTML version if provided
+
+    body = MIMEMultipart("alternative")
+    body.attach(MIMEText(body_text, "plain", "utf-8"))
     if body_html:
-        msg.attach(MIMEText(body_html, "html"))
+        body.attach(MIMEText(body_html, "html", "utf-8"))
+    msg.attach(body)
 
     if attachment_path and os.path.exists(attachment_path):
         try:
@@ -358,21 +396,24 @@ def send_email(subject, body_text, body_html=None, attachment_path=None):
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(attachment.read())
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(attachment_path)}")
+            part.add_header("Content-Disposition", "attachment", filename=os.path.basename(attachment_path))
             msg.attach(part)
         except Exception as e:
             print(f"Failed to attach file: {e}")
     try:
         all_recipients = [recipient] + bcc_list
-        with smtplib.SMTP(smtp_server, int(smtp_port)) as server:
+        with smtplib.SMTP(smtp_server, int(smtp_port), timeout=60) as server:
             server.starttls()
             server.login(smtp_user, smtp_password)
             server.send_message(msg, to_addrs=all_recipients)
-        
+
         bcc_msg = f" (BCC: {', '.join(bcc_list)})" if bcc_list else ""
-        print(f"Email sent successfully to {recipient}{bcc_msg} with attachment.")
+        print(f"Email sent successfully to {recipient}{bcc_msg}"
+              f"{' with attachment' if attachment_path else ''}.")
+        return True
     except Exception as e:
         print(f"Failed to send email: {e}")
+        return False
 
 if __name__ == "__main__":
     import sys
@@ -380,11 +421,18 @@ if __name__ == "__main__":
     
     input_file = sys.argv[1] if len(sys.argv) > 1 else "ips.txt"
     # Parse IPs and CIDRs from file
-    ip_list = parse_ips_from_file(input_file)
-    
+    ip_list, invalid_lines = parse_ips_from_file(input_file)
+
     if not ip_list:
-        print(f"No valid IPs found in {input_file}. Using default fallback for testing.")
-        ip_list = [ipaddress.ip_address(ip) for ip in ["127.0.0.1", "8.8.8.8", "8.8.4.4"]]
+        # A missing or broken list must not turn into a normal-looking report
+        # (this used to scan 127.0.0.1 / 8.8.8.8 / 8.8.4.4 and mail the result).
+        why = "does not exist" if not os.path.exists(input_file) else "has no valid IP/CIDR entries"
+        msg = f"IP scan NOT run: {os.path.abspath(input_file)} {why}."
+        if invalid_lines:
+            msg += "\nInvalid lines:\n" + "\n".join(invalid_lines)
+        print(msg)
+        send_email("IP Scanner FAILED - no targets", msg)
+        sys.exit(1)
 
     # Run scanner with multi-threading
     results, c_segments = run_scanner(ip_list, max_workers=100)
@@ -413,9 +461,13 @@ if __name__ == "__main__":
         f"Active segments: {active_segments}\n"
         f"Scan Duration: {duration}\n\n"
     )
+    if invalid_lines:
+        summary_text += "Skipped invalid lines in ips.txt: " + ", ".join(invalid_lines) + "\n\n"
     if supernet_report_text:
         summary_text += supernet_report_text
     summary_text += "\n\nPlease find the detailed CSV attachment for results."
+    invalid_html = ("<p><strong>Skipped invalid lines in ips.txt:</strong> "
+                    + ", ".join(html.escape(l) for l in invalid_lines) + "</p>") if invalid_lines else ""
 
     summary_html = f"""
     <html>
@@ -427,10 +479,13 @@ if __name__ == "__main__":
             <li><strong>Active segments:</strong> {active_segments}</li>
             <li><strong>Scan Duration:</strong> {duration}</li>
         </ul>
+        {invalid_html}
         {supernet_report_html}
         <p><br>Please find the detailed CSV attachment for results.</p>
     </body>
     </html>
     """
     
-    send_email("IP Scanner Daily Report", summary_text, body_html=summary_html, attachment_path="scan_results.csv")
+    if not send_email("IP Scanner Daily Report", summary_text, body_html=summary_html,
+                      attachment_path="scan_results.csv"):
+        sys.exit(1)  # let systemd record the failure
